@@ -36,14 +36,21 @@ def table_name_previous_day():
     return f"global_temp.url_{year}_{month}_{day}"
 
 def foreach_batch_function_hdfs(df, epoch_id):
+    """
+    write df to hdfs
+    """
     df.write.mode('append').parquet(f"file:////home/tuanvm/spark_streaming/data/{str(date.today())}.parquet")
 
 def foreach_batch_function_redis(df, epoch_id):
+    """
+    process df, write to redis
+    """
     now = datetime.now()
     if datetime.now().hour == 0 and 0 <= now.minute and now.minute <= 2:
         if spark.catalog.tableExists(f"global_temp.{table_name_previous_day()}"):
             spark.catalog.dropGlobalTempView(table_name_previous_day())
 
+    # select temp view
     try:
         temp_df = spark.sql(f"SELECT * from global_temp.{table_name_today()}")
     except AnalysisException:
@@ -51,6 +58,7 @@ def foreach_batch_function_redis(df, epoch_id):
     finally:
         temp_df.show(truncate=False)
     
+    # select sum-up table in redis
     try:
         df_sum_up_previous_6_days = spark.read\
                             .format("org.apache.spark.sql.redis")\
@@ -58,12 +66,16 @@ def foreach_batch_function_redis(df, epoch_id):
     except Py4JJavaError:
         df_sum_up_previous_6_days = spark.createDataFrame(spark.sparkContext.emptyRDD(), columns)
 
+    # union 3 dataframes
     current_union_temp_df = df.union(temp_df)
     current_union_temp_df = current_union_temp_df.union(df_sum_up_previous_6_days)
 
+    # group by then count the frequency of each topic for each subscriberid
     current_union_temp_df = current_union_temp_df.groupBy("label", "subscriberid").agg(_sum("count").alias("count"))
+    # create global temp view
     current_union_temp_df.createOrReplaceGlobalTempView(table_name_today())
 
+    # sort and select top 5 topics with highest frequency for each subscriberid
     ranked_df = current_union_temp_df.withColumn("rank", dense_rank().over(window_spec))
     top5_df = ranked_df.filter(col("rank") <= 5)
 
@@ -75,7 +87,7 @@ def foreach_batch_function_redis(df, epoch_id):
     concatenate_label_count_udf = udf(concatenate_label_count, StringType())
     result_df = grouped_df.withColumn("label_count", concatenate_label_count_udf(col("label_count"))).select("subscriberid", "label_count")
     
-    #result_df.show(truncate=False)
+    # write to kafka
     result_df.selectExpr("CAST(subscriberid AS STRING) AS key", "to_json(struct(*)) AS value").write \
             .format("kafka") \
             .option("kafka.bootstrap.servers", f"{KAFKA_HOST}:{KAFKA_BROKER1_PORT},{KAFKA_HOST}:{KAFKA_BROKER2_PORT},{KAFKA_HOST}:{KAFKA_BROKER3_PORT}") \
@@ -139,12 +151,4 @@ if __name__ == '__main__':
         .foreachBatch(foreach_batch_function_redis) \
         .start()
     
-    # writing_df = exploded_df \
-    #     .writeStream \
-    #     .format("console") \
-    #     .option("checkpointLocation","file:////home/tuanvm/spark_streaming/data/checkpoint_dir") \
-    #     .outputMode("append") \
-    #     .start()
-
-    # todo: modify
     spark.streams.awaitAnyTermination()

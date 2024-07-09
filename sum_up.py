@@ -2,6 +2,10 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import sum as _sum
 from datetime import date, timedelta
 
+"""
+read from postgres, create sum-up table of 6 previous days, write into redis
+"""
+
 spark: SparkSession = SparkSession.builder \
         .appName("Insert postgres") \
         .config('spark.jars', 'file:////home/tuanvm/spark_streaming/postgresql-42.7.2.jar') \

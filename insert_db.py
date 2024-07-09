@@ -1,6 +1,11 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import current_date, date_sub
 from pyspark.sql.functions import sum as _sum
+from datetime import date, timedelta
+
+"""
+read parquet -> insert into postgres
+"""
 
 spark: SparkSession = SparkSession.builder \
         .appName("Insert postgres") \
@@ -9,8 +14,7 @@ spark: SparkSession = SparkSession.builder \
         .master("spark://mhtuan-HP:7077") \
         .getOrCreate()
 
-# df = spark.read.parquet(f"file:////home/tuanvm/spark_streaming/data/{str(date.today() - timedelta(days=1))}.parquet")
-df = spark.read.format("csv").option("header", "true").load(f"file:////home/tuanvm/spark_streaming/test.csv")
+df = spark.read.parquet(f"file:////home/tuanvm/spark_streaming/data/{str(date.today() - timedelta(days=1))}.parquet")
 
 df.show()
 
@@ -27,14 +31,3 @@ df.write \
     .option("driver", "org.postgresql.Driver") \
     .mode("append")\
     .save()
-
-# df_read = spark.read \
-#     .format("jdbc") \
-#     .option("url", "jdbc:postgresql://localhost:5432/postgres") \
-#     .option("dbtable", "public.url") \
-#     .option("user", "postgres") \
-#     .option("password", "postgres") \
-#     .option("driver", "org.postgresql.Driver") \
-#     .load()
-
-# df_read.show()
