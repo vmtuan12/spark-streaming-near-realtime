@@ -1,7 +1,7 @@
 from pyspark.sql import SparkSession, DataFrame, Window
 from pyspark.sql.types import StringType, StructField, StructType, IntegerType
-from pyspark.sql.functions import from_json, current_timestamp, current_date, udf, col, dense_rank, collect_list, struct
-from pyspark.sql.functions import sum as _sum
+from pyspark.sql.functions import from_json, current_timestamp, current_date, udf, col, dense_rank, collect_list, struct, lit
+from pyspark.sql.functions import sum as _sum, max as _max
 from datetime import date, timedelta
 from pyspark.errors.exceptions.captured import AnalysisException
 from py4j.protocol import Py4JJavaError
@@ -16,7 +16,9 @@ json_schema = StructType([
     StructField('domain', StringType(), True),
     StructField('label', StringType(), True),
     StructField('subscriberid', StringType(), True),
-    StructField('count', IntegerType(), True)
+    StructField('count', IntegerType(), True),
+    StructField('created_at_sec', IntegerType(), True),
+    StructField('created_at', StringType(), True)
 ])
 
 def table_name_today():
@@ -35,13 +37,7 @@ def table_name_previous_day():
 
     return f"global_temp.url_{year}_{month}_{day}"
 
-def foreach_batch_function_hdfs(df, epoch_id):
-    """
-    write df to hdfs
-    """
-    df.write.mode('append').parquet(f"file:////home/tuanvm/spark_streaming/data/{str(date.today())}.parquet")
-
-def foreach_batch_function_redis(df, epoch_id):
+def foreach_batch_function_kafka(df: DataFrame, epoch_id):
     """
     process df, write to redis
     """
@@ -58,43 +54,24 @@ def foreach_batch_function_redis(df, epoch_id):
     finally:
         temp_df.show(truncate=False)
     
-    # select sum-up table in redis
-    try:
-        df_sum_up_previous_6_days = spark.read\
-                            .format("org.apache.spark.sql.redis")\
-                            .option("table", "topic-sum-up").load()
-    except Py4JJavaError:
-        df_sum_up_previous_6_days = spark.createDataFrame(spark.sparkContext.emptyRDD(), columns)
+    df_sum_up_previous_6_days = spark.createDataFrame(spark.sparkContext.emptyRDD(), columns)
 
     # union 3 dataframes
     current_union_temp_df = df.union(temp_df)
     current_union_temp_df = current_union_temp_df.union(df_sum_up_previous_6_days)
 
     # group by then count the frequency of each topic for each subscriberid
-    current_union_temp_df = current_union_temp_df.groupBy("label", "subscriberid").agg(_sum("count").alias("count"))
+    current_union_temp_df = current_union_temp_df.groupBy("label", "subscriberid").agg(_sum("count").alias("count"), _max("created_at").alias("created_at"))
     # create global temp view
+    result_df = current_union_temp_df.withColumn("done_at", lit(str(datetime.now())))
     current_union_temp_df.createOrReplaceGlobalTempView(table_name_today())
-
-    # sort and select top 5 topics with highest frequency for each subscriberid
-    ranked_df = current_union_temp_df.withColumn("rank", dense_rank().over(window_spec))
-    top5_df = ranked_df.filter(col("rank") <= 5)
-
-    grouped_df = top5_df.withColumn("timestamp", current_timestamp())\
-                        .withWatermark("timestamp", "1 minutes")\
-                        .groupBy("subscriberid")\
-                        .agg(collect_list(struct(col("label"), col("count"))).alias("label_count"))
-
-    concatenate_label_count_udf = udf(concatenate_label_count, StringType())
-    result_df = grouped_df.withColumn("label_count", concatenate_label_count_udf(col("label_count"))).select("subscriberid", "label_count")
     
     # write to kafka
     result_df.selectExpr("CAST(subscriberid AS STRING) AS key", "to_json(struct(*)) AS value").write \
             .format("kafka") \
-            .option("kafka.bootstrap.servers", f"{KAFKA_HOST}:{KAFKA_BROKER1_PORT},{KAFKA_HOST}:{KAFKA_BROKER2_PORT},{KAFKA_HOST}:{KAFKA_BROKER3_PORT}") \
-            .option("topic", "url_processed") \
+            .option("kafka.bootstrap.servers", f"{KAFKA_HOST}:{KAFKA_BROKER1_PORT}") \
+            .option("topic", "spark-topic-count.access-count") \
             .save()
-
-    #result_df.write.format("org.apache.spark.sql.redis").option("table", f"{str(date.today()).replace('-', '_')}-hot-topic").option("key.column", "subscriberid").mode("overwrite").save()
 
 def concatenate_label_count(pairs):
     return ",".join([f"{pair['label']}:{pair['count']}" for pair in pairs])
@@ -104,51 +81,47 @@ columns = StructType([StructField('label',
                     StructField('subscriberid',
                                 StringType(), True),
                     StructField('count',
-                                IntegerType(), True)])
+                                IntegerType(), True),
+                    StructField('created_at',
+                                StringType(), True)])
 
 if __name__ == '__main__':
 
     spark: SparkSession = SparkSession.builder \
         .appName("Streaming from Kafka") \
         .config("spark.streaming.stopGracefullyOnShutdown", True) \
-        .config("spark.executor.cores", "10") \
-        .config("spark.executor.memory", "100G") \
+        .config("spark.executor.cores", "4") \
+        .config("spark.executor.memory", "4G") \
+        .config("spark.executor.instances", "5") \
         .config('spark.jars.packages', 'org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1') \
         .config("spark.sql.shuffle.partitions", 4) \
-        .config("spark.redis.host", "localhost") \
-        .config("spark.redis.port", "6379") \
-        .master("spark://server195:7077") \
+        .master("spark://mhtuan-HP:7077") \
         .getOrCreate()
+    
+    spark.conf.set("spark.executor.memory", "40g")
 
     window_spec = Window.partitionBy("subscriberid").orderBy(col("count").desc())
     # failOnDataLoss: https://stackoverflow.com/questions/64922560/pyspark-and-kafka-set-are-gone-some-data-may-have-been-missed
     df = spark.readStream \
         .format("kafka") \
-        .option("kafka.bootstrap.servers", f"{KAFKA_HOST}:{KAFKA_BROKER1_PORT},{KAFKA_HOST}:{KAFKA_BROKER2_PORT},{KAFKA_HOST}:{KAFKA_BROKER3_PORT}") \
+        .option("kafka.bootstrap.servers", f"{KAFKA_HOST}:{KAFKA_BROKER1_PORT}") \
         .option("group.id", "tuan-1") \
         .option("enable.auto.commit", True) \
         .option("failOnDataLoss", "false") \
-        .option("subscribe", "url") \
+        .option("subscribe", "spark-topic-count.url") \
         .load()
     json_df = df.selectExpr("CAST(key AS STRING)", "CAST(value AS STRING) as msg_value")
 
     json_expanded_df = json_df.withColumn("msg_value", from_json(json_df["msg_value"], json_schema)).select("msg_value.*")
 
-    exploded_df = json_expanded_df.select("label", "subscriberid", "count")
-
-    write_hdfs_df = exploded_df.writeStream\
-                                .format("parquet")\
-                                .outputMode("append")\
-                                .option("checkpointLocation", "file:////home/tuanvm/spark_streaming/data/checkpoint_dir_hdfs")\
-                                .foreachBatch(foreach_batch_function_hdfs)\
-                                .start()
+    exploded_df = json_expanded_df.select("label", "subscriberid", "count", "created_at")
     
     write_redis_df = exploded_df \
         .writeStream \
         .outputMode("append")\
         .format("console")\
-        .option("checkpointLocation", "file:////home/tuanvm/spark_streaming/data/checkpoint_dir_redis")\
-        .foreachBatch(foreach_batch_function_redis) \
+        .option("checkpointLocation", "file:////home/mhtuan/work/ct1/streaming/spark_streaming/checkpoint_dir_redis")\
+        .foreachBatch(foreach_batch_function_kafka) \
         .start()
     
     spark.streams.awaitAnyTermination()
