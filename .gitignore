@@ -4,3 +4,4 @@ test*
 *.csv
 data/
 *.ipynb
+checkpoint_dir_redis/
